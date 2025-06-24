@@ -32,11 +32,17 @@
 
 #pragma warning(disable : 4005)
 #pragma warning(disable : 4311)
+#pragma warning(disable : 4312)
 
 #define UNICODE
+#define _WIN32_DCOM
+
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <windows.h>
+#include <Windows.h>
+#include <processsnapshot.h>
+#include <memoryapi.h>
+#include <Wbemidl.h>
 #include <iphlpapi.h>
 #include <tlhelp32.h>
 #include <psapi.h>
@@ -45,21 +51,27 @@
 #include <richedit.h>
 #include <shlobj.h>
 
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 #include <stdio.h>
 #include <stddef.h>
 #include <wchar.h>
 
 #include "../NTlib/nttpp.h"
 
+#pragma comment(lib, "wbemuuid.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleAut32.lib")
 #pragma comment(lib, "advapi32.lib")
-#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "dbghelp.lib")
 #pragma comment(lib, "winspool.lib")
-#pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "dbghelp.lib")
 #pragma comment(lib, "user32.lib")
-#pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "shlwapi.lib")
-#pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "kernel32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "OneCore.lib")
 
 // Relative Virtual Address to Virtual Address
 #define RVA2VA(type, base, rva) (type)((ULONG_PTR) base + rva)
@@ -147,7 +159,8 @@ BOOL SetPrivilege(PWCHAR szPrivilege, BOOL bEnable){
       tp.Privileges[0].Attributes = bEnable?SE_PRIVILEGE_ENABLED:SE_PRIVILEGE_REMOVED;
 
       // adjust token
-      bResult = AdjustTokenPrivileges(hToken, FALSE, &tp, 0, NULL, NULL);
+      AdjustTokenPrivileges(hToken, FALSE, &tp, 0, NULL, NULL);
+      bResult = GetLastError() == ERROR_SUCCESS;
     }
     CloseHandle(hToken);
     return bResult;
@@ -201,6 +214,147 @@ PWCHAR pid2name(DWORD pid) {
     return name;
 }
 
+LPVOID GetRemoteModuleHandle(DWORD pid, LPCWSTR lpModuleName) {
+    HANDLE        ss;
+    MODULEENTRY32 me;
+    LPVOID        ba = NULL;
+    
+    ss = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
+    
+    if(ss == INVALID_HANDLE_VALUE) return NULL;
+    
+    me.dwSize = sizeof(MODULEENTRY32);
+    
+    if(Module32First(ss, &me)) {
+      do {
+        if(me.th32ProcessID == pid) {
+          if(lstrcmpi(me.szModule, lpModuleName)==0) {
+            ba = me.modBaseAddr;
+            break;
+          }
+        }
+      } while(Module32Next(ss, &me));
+    }
+    CloseHandle(ss);
+    return ba;
+}
+
+PWCHAR addr2sym(HANDLE hp, LPVOID addr) {
+    WCHAR        path[MAX_PATH];
+    BYTE         buf[sizeof(SYMBOL_INFO)+MAX_SYM_NAME*sizeof(WCHAR)];
+    PSYMBOL_INFO si=(PSYMBOL_INFO)buf;
+    static WCHAR name[MAX_PATH];
+    
+    ZeroMemory(path, ARRAYSIZE(path));
+    ZeroMemory(name, ARRAYSIZE(name));
+          
+    GetMappedFileName(
+      hp, addr, path, MAX_PATH);
+    
+    PathStripPath(path);
+    
+    si->SizeOfStruct = sizeof(SYMBOL_INFO);
+    si->MaxNameLen   = MAX_SYM_NAME;
+    
+    if(SymFromAddr(hp, (DWORD64)addr, NULL, si)) {
+      wsprintf(name, L"%s!%hs", path, si->Name);
+    } else {
+      lstrcpy(name, path);
+    }
+    return name;
+}
+
+PWCHAR wnd2proc(HWND hw) {
+    PWCHAR         name=L"N/A";
+    DWORD          pid;
+    HANDLE         ss;
+    BOOL           bResult;
+    PROCESSENTRY32 pe;
+    
+    GetWindowThreadProcessId(hw, &pid);
+    
+    ss = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    
+    if(ss != INVALID_HANDLE_VALUE) {
+      pe.dwSize = sizeof(PROCESSENTRY32);
+      
+      bResult = Process32First(ss, &pe);
+      while (bResult) {
+        if (pe.th32ProcessID == pid) {
+          name = pe.szExeFile;
+          break;
+        }
+        bResult = Process32Next(ss, &pe);
+      }
+      CloseHandle(ss);
+    }
+    return name;
+}
+
+void ShowProcessIntegrityLevel(DWORD pid)
+{
+ HANDLE hToken;
+ HANDLE hProcess;
+
+ DWORD dwLengthNeeded;
+ DWORD dwError = ERROR_SUCCESS;
+
+ PTOKEN_MANDATORY_LABEL pTIL = NULL;
+ LPWSTR pStringSid;
+ DWORD dwIntegrityLevel;
+ 
+ hProcess = OpenProcess(PROCESS_ALL_ACCESS,FALSE,pid);
+ if (OpenProcessToken(hProcess, TOKEN_QUERY, &hToken)) 
+ {
+  // Get the Integrity level.
+  if (!GetTokenInformation(hToken, TokenIntegrityLevel, 
+      NULL, 0, &dwLengthNeeded))
+  {
+   dwError = GetLastError();
+   if (dwError == ERROR_INSUFFICIENT_BUFFER)
+   {
+    pTIL = (PTOKEN_MANDATORY_LABEL)LocalAlloc(0, 
+         dwLengthNeeded);
+    if (pTIL != NULL)
+    {
+     if (GetTokenInformation(hToken, TokenIntegrityLevel, 
+         pTIL, dwLengthNeeded, &dwLengthNeeded))
+     {
+      dwIntegrityLevel = *GetSidSubAuthority(pTIL->Label.Sid, 
+        (DWORD)(UCHAR)(*GetSidSubAuthorityCount(pTIL->Label.Sid)-1));
+ 
+      if (dwIntegrityLevel == SECURITY_MANDATORY_LOW_RID)
+      {
+       // Low Integrity
+       wprintf(L"Low");
+      }
+      else if (dwIntegrityLevel >= SECURITY_MANDATORY_MEDIUM_RID && 
+           dwIntegrityLevel < SECURITY_MANDATORY_HIGH_RID)
+      {
+       // Medium Integrity
+       wprintf(L"Medium");
+      }
+      else if (dwIntegrityLevel >= SECURITY_MANDATORY_HIGH_RID)
+      {
+       // High Integrity
+       wprintf(L"High Integrity");
+      }
+      else if (dwIntegrityLevel >= SECURITY_MANDATORY_SYSTEM_RID)
+      {
+       // System Integrity
+       wprintf(L"System Integrity");
+      }
+     }
+     LocalFree(pTIL);
+    }
+   }
+  }
+  CloseHandle(hToken);
+ }
+ CloseHandle(hProcess);
+ putchar('\n');
+}
+
 /**
   read a shellcode from disk into memory
 */
@@ -222,6 +376,96 @@ DWORD readpic(PWCHAR path, LPVOID *pic){
       CloseHandle(hf);
     }
     return rd;
+}
+
+// returns TRUE if ptr is heap
+BOOL IsHeapPtr(LPVOID ptr) {
+    MEMORY_BASIC_INFORMATION mbi;
+    DWORD                    res;
+    
+    if(ptr == NULL) return FALSE;
+    
+    // query the pointer
+    res = VirtualQuery(ptr, &mbi, sizeof(mbi));
+    if(res != sizeof(mbi)) return FALSE;
+
+    return ((mbi.State   == MEM_COMMIT    ) &&
+            (mbi.Type    == MEM_PRIVATE   ) && 
+            (mbi.Protect == PAGE_READWRITE));
+}
+
+// returns TRUE if ptr is .data
+BOOL IsDataPtr(LPVOID ptr) {
+    MEMORY_BASIC_INFORMATION mbi;
+    DWORD                    res;
+    
+    if(ptr == NULL) return FALSE;
+    
+    // query the pointer
+    res = VirtualQuery(ptr, &mbi, sizeof(mbi));
+    if(res != sizeof(mbi)) return FALSE;
+
+    return ((mbi.State   == MEM_COMMIT    ) &&
+            (mbi.Type    == MEM_IMAGE     ) && 
+            (mbi.Protect == PAGE_READWRITE));
+}
+
+// returns TRUE if ptr is RX code
+BOOL IsCodePtr(LPVOID ptr) {
+    MEMORY_BASIC_INFORMATION mbi;
+    DWORD                    res;
+    
+    if(ptr == NULL) return FALSE;
+    
+    // query the pointer
+    res = VirtualQuery(ptr, &mbi, sizeof(mbi));
+    if(res != sizeof(mbi)) return FALSE;
+
+    return ((mbi.State   == MEM_COMMIT    ) &&
+            (mbi.Type    == MEM_IMAGE     ) && 
+            (mbi.Protect == PAGE_EXECUTE_READ));
+}
+
+BOOL IsCodePtrEx(HANDLE hp, LPVOID ptr) {
+    MEMORY_BASIC_INFORMATION mbi;
+    DWORD                    res;
+    
+    if(ptr == NULL) return FALSE;
+    
+    // query the pointer
+    res = VirtualQueryEx(hp, ptr, &mbi, sizeof(mbi));
+    if(res != sizeof(mbi)) return FALSE;
+
+    return ((mbi.State   == MEM_COMMIT    ) &&
+            (mbi.Type    == MEM_IMAGE     ) && 
+            (mbi.Protect == PAGE_EXECUTE_READ));
+}
+
+BOOL IsMapPtr(LPVOID ptr) {
+    MEMORY_BASIC_INFORMATION mbi;
+    DWORD                    res;
+    
+    if(ptr == NULL) return FALSE;
+    
+    // query the pointer
+    res = VirtualQuery(ptr, &mbi, sizeof(mbi));
+    if(res != sizeof(mbi)) return FALSE;
+
+    return ((mbi.State   == MEM_COMMIT) &&
+            (mbi.Type    == MEM_MAPPED));
+}
+
+BOOL IsReadWritePtr(LPVOID ptr) {
+    MEMORY_BASIC_INFORMATION mbi;
+    DWORD                    res;
+    
+    if(ptr == NULL) return FALSE;
+    
+    // query the pointer
+    res = VirtualQuery(ptr, &mbi, sizeof(mbi));
+    if(res != sizeof(mbi)) return FALSE;
+
+    return (mbi.Protect == PAGE_READWRITE);    
 }
 
 #endif

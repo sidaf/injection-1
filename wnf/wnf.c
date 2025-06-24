@@ -167,50 +167,6 @@ LPVOID GetUserSubFromProcessOld(
     return sa;
 }
 
-LPVOID GetRemoteModuleHandle(DWORD pid, LPCWSTR lpModuleName) {
-    HANDLE        ss;
-    MODULEENTRY32 me;
-    LPVOID        ba = NULL;
-    
-    ss = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
-    
-    if(ss == INVALID_HANDLE_VALUE) return NULL;
-    
-    me.dwSize = sizeof(MODULEENTRY32);
-    
-    if(Module32First(ss, &me)) {
-      do {
-        if(me.th32ProcessID == pid) {
-          if(lstrcmpi(me.szModule, lpModuleName)==0) {
-            ba = me.modBaseAddr;
-            break;
-          }
-        }
-      } while(Module32Next(ss, &me));
-    }
-    CloseHandle(ss);
-    return ba;
-}
-
-// does the pointer reside in the .code section?
-BOOL IsHeapPtr(LPVOID ptr) {
-    MEMORY_BASIC_INFORMATION mbi;
-    DWORD                    res;
-    
-    if(ptr == NULL) return FALSE;
-    
-    // query the pointer
-    res = VirtualQuery(ptr, &mbi, sizeof(mbi));
-    if(res != sizeof(mbi)) return FALSE;
-
-    return ((mbi.State   == MEM_COMMIT    ) &&
-            (mbi.Type    == MEM_PRIVATE   ) && 
-            (mbi.Protect == PAGE_READWRITE));
-}
-
-// Relative Virtual Address to Virtual Address
-#define RVA2VA(type, base, rva) (type)((ULONG_PTR) base + rva)
-
 LPVOID GetUserSubFromProcess(
   HANDLE hp, DWORD pid, PWNF_USER_SUBSCRIPTION us, ULONG64 sn)
 {
@@ -234,9 +190,6 @@ LPVOID GetUserSubFromProcess(
     // Finally, read a user subscription
     LoadLibrary(L"efswrt.dll");
 
-    // get base of ntdll.dll in remote process
-    rm  = GetRemoteModuleHandle(pid, L"ntdll.dll");
-    
     // load local copy
     m   = LoadLibrary(L"ntdll.dll");
     dos = (PIMAGE_DOS_HEADER)m;  
@@ -262,16 +215,14 @@ LPVOID GetUserSubFromProcess(
          tbl->Header.NodeByteSize == sizeof(WNF_SUBSCRIPTION_TABLE)) 
       {
         // save the virtual address
-        va = ((PBYTE)&ds[i] - (PBYTE)m) + (PBYTE)rm;
+        va = (PBYTE)&ds[i];
         break;
       }
     }
     if(va != NULL) {
-      ReadProcessMemory(
-        hp, va, &ptr, sizeof(ULONG_PTR), &rd);
-          
-        // read a user subscription from remote
-        sa = GetUserSubFromTable(hp, (LPVOID)ptr, us, sn);
+      ReadProcessMemory(hp, va, &ptr, sizeof(ULONG_PTR), &rd);
+      // read a user subscription from remote
+      sa = GetUserSubFromTable(hp, (LPVOID)ptr, us, sn);
     }
     return sa;
 }
